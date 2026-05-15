@@ -1,0 +1,13 @@
+# Signing certificates — never commit private keys
+certs/
+*.pem
+*.key
+
+# Build artifacts
+build/
+
+# Backup files
+*_backup.json
+
+# macOS
+.DS_Store

@@ -1,0 +1,427 @@
+name: custom:sql.mssql.wait-stats
+version: "1.0.2"
+minDynatraceVersion: "1.279.0"
+author:
+  name: "Custom"
+
+vars:
+  - id: longest-queries-timeout
+    displayName: Longest Queries Timeout (seconds)
+    description: >-
+      Maximum number of seconds to wait before cancelling a long-running
+      monitoring query.
+    type: text
+
+sqlServer:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Feature set: Queries  ── Query Store based wait stats (original)
+  # ─────────────────────────────────────────────────────────────────────────────
+  - group: query_wait_stats
+    interval:
+      minutes: 60
+    featureSet: Queries
+    ingest: log
+    timeout: var:longest-queries-timeout
+    attributes:
+      - key: extension
+        value: const:sql_mssql
+      - key: event.group
+        value: const:query_wait_stats
+      - key: instance
+        value: col:instance_name
+      - key: server
+        value: col:server_name
+      - key: content
+        value: col:query_sql_text
+      - key: query_id
+        value: col:query_id
+      - key: object_id
+        value: col:object_id
+      - key: sql_id
+        value: col:plan_id
+      - key: wait_category
+        value: col:wait_category_desc
+      - key: total_wait_time_ms
+        value: col:total_wait_time_ms
+      - key: avg_wait_time_ms
+        value: col:avg_wait_time_ms
+      - key: max_wait_time_ms
+        value: col:max_wait_time_ms
+    query: >-
+      SELECT TOP (100)
+        UPPER(
+          ISNULL(
+            CONVERT(sysname, SERVERPROPERTY('InstanceName')),
+            'MSSQLSERVER'
+          )
+        )                                     AS instance_name,
+        LEFT(
+          CONVERT(sysname, SERVERPROPERTY('ServerName')),
+          ISNULL(
+            NULLIF(
+              CHARINDEX('\', CONVERT(sysname, SERVERPROPERTY('ServerName'))) -1,
+              -1
+            ),
+            LEN(CONVERT(sysname, SERVERPROPERTY('ServerName')))
+          )
+        )                                     AS server_name,
+        queries.query_id                      AS query_id,
+        queries.object_id                     AS object_id,
+        ws.plan_id                            AS plan_id,
+        ws.wait_category_desc                 AS wait_category_desc,
+        texts.query_sql_text                  AS query_sql_text,
+        ROUND(
+          CONVERT(float, SUM(ws.total_query_wait_time_ms)),
+          2
+        )                                     AS total_wait_time_ms,
+        ROUND(
+          CONVERT(float, SUM(ws.avg_query_wait_time_ms)),
+          2
+        )                                     AS avg_wait_time_ms,
+        ROUND(
+          CONVERT(float, MAX(ws.max_query_wait_time_ms)),
+          2
+        )                                     AS max_wait_time_ms
+      FROM
+        (
+          SELECT TOP (1) runtime_stats_interval_id
+          FROM sys.query_store_runtime_stats_interval WITH (NOLOCK)
+          ORDER BY start_time DESC
+        ) intervals
+        JOIN sys.query_store_wait_stats ws WITH (NOLOCK)
+          ON ws.runtime_stats_interval_id = intervals.runtime_stats_interval_id
+        JOIN sys.query_store_plan plans WITH (NOLOCK)
+          ON ws.plan_id = plans.plan_id
+        JOIN sys.query_store_query queries WITH (NOLOCK)
+          ON plans.query_id = queries.query_id
+        JOIN sys.query_store_query_text texts WITH (NOLOCK)
+          ON queries.query_text_id = texts.query_text_id
+      GROUP BY
+        queries.query_id,
+        queries.object_id,
+        ws.plan_id,
+        ws.wait_category_desc,
+        texts.query_sql_text
+      ORDER BY
+        total_wait_time_ms DESC
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Feature set: DMV Wait Stats  ── Instance-level cumulative wait stats
+  #   Source: sys.dm_os_wait_stats
+  #   Interval: 5 min — captures trending wait accumulation without requiring
+  #   Query Store to be enabled on the target database.
+  #   Benign system/idle waits are filtered to reduce noise.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - group: dmv_instance_wait_stats
+    interval:
+      minutes: 5
+    featureSet: DMV Wait Stats
+    ingest: log
+    timeout: var:longest-queries-timeout
+    attributes:
+      - key: extension
+        value: const:sql_mssql
+      - key: event.group
+        value: const:dmv_instance_wait_stats
+      - key: content
+        value: col:wait_type
+      - key: instance
+        value: col:instance_name
+      - key: server
+        value: col:server_name
+      - key: wait_type
+        value: col:wait_type
+      - key: wait_category
+        value: col:wait_category_desc
+      - key: waiting_tasks_count
+        value: col:waiting_tasks_count
+      - key: total_wait_time_ms
+        value: col:total_wait_time_ms
+      - key: avg_wait_time_ms
+        value: col:avg_wait_time_ms
+      - key: max_wait_time_ms
+        value: col:max_wait_time_ms
+      - key: signal_wait_time_ms
+        value: col:signal_wait_time_ms
+    query: >-
+      SELECT TOP (100)
+        UPPER(
+          ISNULL(
+            CONVERT(sysname, SERVERPROPERTY('InstanceName')),
+            'MSSQLSERVER'
+          )
+        )                                                   AS instance_name,
+        LEFT(
+          CONVERT(sysname, SERVERPROPERTY('ServerName')),
+          ISNULL(
+            NULLIF(
+              CHARINDEX('\', CONVERT(sysname, SERVERPROPERTY('ServerName'))) - 1,
+              -1
+            ),
+            LEN(CONVERT(sysname, SERVERPROPERTY('ServerName')))
+          )
+        )                                                   AS server_name,
+        wait_type                                           AS wait_type,
+        CASE
+          WHEN wait_type LIKE 'LCK%'
+            THEN 'Lock'
+          WHEN wait_type IN (
+            'ASYNC_IO_COMPLETION', 'IO_COMPLETION', 'WRITELOG',
+            'PAGEIOLATCH_SH', 'PAGEIOLATCH_EX', 'PAGEIOLATCH_UP'
+          ) OR wait_type LIKE 'IO%'
+            THEN 'Buffer I/O'
+          WHEN wait_type LIKE 'PAGELATCH%' OR wait_type LIKE 'LATCH%'
+            THEN 'Latch'
+          WHEN wait_type IN ('ASYNC_NETWORK_IO', 'NET_WAITFOR_PACKET')
+            OR wait_type LIKE 'NETWORK%'
+            THEN 'Network I/O'
+          WHEN wait_type IN ('CXPACKET', 'CXCONSUMER', 'CXSYNC_PORT', 'CXSYNC_CONSUMER')
+            THEN 'Parallelism'
+          WHEN wait_type IN (
+            'MEMORY_ALLOCATION_EXT', 'RESOURCE_SEMAPHORE',
+            'RESOURCE_SEMAPHORE_QUERY_COMPILE', 'CMEMTHREAD'
+          )
+            THEN 'Memory'
+          WHEN wait_type LIKE 'HADR%' OR wait_type LIKE 'DBMIRRORING%'
+            THEN 'Replication'
+          WHEN wait_type = 'SOS_SCHEDULER_YIELD'
+            THEN 'CPU'
+          WHEN wait_type LIKE 'BACKUP%'
+            THEN 'Backup'
+          ELSE 'Other'
+        END                                                 AS wait_category_desc,
+        waiting_tasks_count                                 AS waiting_tasks_count,
+        ROUND(CONVERT(float, wait_time_ms), 2)              AS total_wait_time_ms,
+        ROUND(
+          CASE
+            WHEN waiting_tasks_count > 0
+              THEN CONVERT(float, wait_time_ms) / waiting_tasks_count
+            ELSE 0
+          END,
+          2
+        )                                                   AS avg_wait_time_ms,
+        ROUND(CONVERT(float, max_wait_time_ms), 2)          AS max_wait_time_ms,
+        ROUND(CONVERT(float, signal_wait_time_ms), 2)       AS signal_wait_time_ms
+      FROM sys.dm_os_wait_stats WITH (NOLOCK)
+      WHERE wait_type NOT IN (
+        'SLEEP_TASK', 'BROKER_TO_FLUSH', 'BROKER_TASK_STOP', 'CLR_AUTO_EVENT',
+        'DISPATCHER_QUEUE_SEMAPHORE', 'FT_IFTS_SCHEDULER_IDLE_WAIT',
+        'HADR_WORK_QUEUE', 'ONDEMAND_TASK_QUEUE', 'REQUEST_FOR_DEADLOCK_SEARCH',
+        'RESOURCE_QUEUE', 'SERVER_IDLE_CHECK', 'SLEEP_DBSTARTUP',
+        'SLEEP_DBRECOVER', 'SLEEP_DBNULL', 'SLEEP_DBOPEN',
+        'SLEEP_TEMPDBSTARTUP', 'SNI_HTTP_ACCEPT',
+        'SP_SERVER_DIAGNOSTICS_SLEEP', 'SQLTRACE_BUFFER_FLUSH',
+        'SQLTRACE_INCREMENTAL_FLUSH_SLEEP', 'WAITFOR',
+        'XE_DISPATCHER_WAIT', 'XE_TIMER_EVENT', 'BROKER_EVENTHANDLER',
+        'CHECKPOINT_QUEUE', 'DBMIRROR_EVENTS_QUEUE', 'SQLTRACE_WAIT_ENTRIES',
+        'WAIT_XTP_OFFLINE_CKPT_NEW_LOG', 'MISCELLANEOUS',
+        'SOS_WORK_DISPATCHER', 'LOGMGR_QUEUE', 'QDS_ASYNC_QUEUE',
+        'DIRTY_PAGE_POLL', 'HADR_FILESTREAM_IOMGR_IOCOMPLETION',
+        'LAZYWRITER_SLEEP', 'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP',
+        'PWAIT_EXTENSIBILITY_CLEANUP_TASK', 'AZURE_IMDS_VERSIONS'
+      )
+      AND wait_time_ms > 0
+      ORDER BY
+        wait_time_ms DESC
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Feature set: DMV Wait Stats  ── Active per-query wait stats (point-in-time)
+  #   Source: sys.dm_exec_requests + sys.dm_exec_sql_text
+  #   Interval: 1 min — short interval to capture transient blocking/waits.
+  #   Only user sessions (session_id > 50) other than the monitoring spid are
+  #   included. Rows where the request has no active wait are still collected so
+  #   elapsed/CPU time is always available for running queries.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - group: dmv_active_wait_stats
+    interval:
+      minutes: 1
+    featureSet: DMV Wait Stats
+    ingest: log
+    timeout: var:longest-queries-timeout
+    attributes:
+      - key: extension
+        value: const:sql_mssql
+      - key: event.group
+        value: const:dmv_active_wait_stats
+      - key: instance
+        value: col:instance_name
+      - key: server
+        value: col:server_name
+      - key: content
+        value: col:query_sql_text
+      - key: session_id
+        value: col:session_id
+      - key: request_id
+        value: col:request_id
+      - key: status
+        value: col:status
+      - key: command
+        value: col:command
+      - key: wait_type
+        value: col:wait_type
+      - key: wait_category
+        value: col:wait_category_desc
+      - key: wait_time_ms
+        value: col:wait_time_ms
+      - key: total_elapsed_time_ms
+        value: col:total_elapsed_time_ms
+      - key: cpu_time_ms
+        value: col:cpu_time_ms
+      - key: logical_reads
+        value: col:logical_reads
+      - key: writes
+        value: col:writes
+      - key: blocking_session_id
+        value: col:blocking_session_id
+      - key: database_name
+        value: col:database_name
+    query: >-
+      SELECT TOP (100)
+        UPPER(
+          ISNULL(
+            CONVERT(sysname, SERVERPROPERTY('InstanceName')),
+            'MSSQLSERVER'
+          )
+        )                                                         AS instance_name,
+        LEFT(
+          CONVERT(sysname, SERVERPROPERTY('ServerName')),
+          ISNULL(
+            NULLIF(
+              CHARINDEX('\', CONVERT(sysname, SERVERPROPERTY('ServerName'))) - 1,
+              -1
+            ),
+            LEN(CONVERT(sysname, SERVERPROPERTY('ServerName')))
+          )
+        )                                                         AS server_name,
+        r.session_id                                              AS session_id,
+        r.request_id                                              AS request_id,
+        r.status                                                  AS status,
+        r.command                                                 AS command,
+        ISNULL(r.wait_type, 'RUNNING')                           AS wait_type,
+        CASE
+          WHEN r.wait_type LIKE 'LCK%'
+            THEN 'Lock'
+          WHEN r.wait_type IN (
+            'ASYNC_IO_COMPLETION', 'IO_COMPLETION', 'WRITELOG',
+            'PAGEIOLATCH_SH', 'PAGEIOLATCH_EX', 'PAGEIOLATCH_UP'
+          ) OR r.wait_type LIKE 'IO%'
+            THEN 'Buffer I/O'
+          WHEN r.wait_type LIKE 'PAGELATCH%' OR r.wait_type LIKE 'LATCH%'
+            THEN 'Latch'
+          WHEN r.wait_type IN ('ASYNC_NETWORK_IO', 'NET_WAITFOR_PACKET')
+            OR r.wait_type LIKE 'NETWORK%'
+            THEN 'Network I/O'
+          WHEN r.wait_type IN ('CXPACKET', 'CXCONSUMER', 'CXSYNC_PORT', 'CXSYNC_CONSUMER')
+            THEN 'Parallelism'
+          WHEN r.wait_type IN (
+            'MEMORY_ALLOCATION_EXT', 'RESOURCE_SEMAPHORE',
+            'RESOURCE_SEMAPHORE_QUERY_COMPILE', 'CMEMTHREAD'
+          )
+            THEN 'Memory'
+          WHEN r.wait_type LIKE 'HADR%' OR r.wait_type LIKE 'DBMIRRORING%'
+            THEN 'Replication'
+          WHEN r.wait_type = 'SOS_SCHEDULER_YIELD'
+            THEN 'CPU'
+          WHEN r.wait_type IS NULL
+            THEN 'Running'
+          ELSE 'Other'
+        END                                                       AS wait_category_desc,
+        ROUND(CONVERT(float, r.wait_time), 2)                    AS wait_time_ms,
+        ROUND(CONVERT(float, r.total_elapsed_time), 2)           AS total_elapsed_time_ms,
+        ROUND(CONVERT(float, r.cpu_time), 2)                     AS cpu_time_ms,
+        r.logical_reads                                           AS logical_reads,
+        r.writes                                                  AS writes,
+        r.blocking_session_id                                     AS blocking_session_id,
+        DB_NAME(r.database_id)                                    AS database_name,
+        SUBSTRING(
+          t.text,
+          (r.statement_start_offset / 2) + 1,
+          (
+            (
+              CASE r.statement_end_offset
+                WHEN -1 THEN DATALENGTH(t.text)
+                ELSE r.statement_end_offset
+              END - r.statement_start_offset
+            ) / 2
+          ) + 1
+        )                                                         AS query_sql_text
+      FROM sys.dm_exec_requests r WITH (NOLOCK)
+      CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+      WHERE r.session_id > 50
+        AND r.session_id <> @@SPID
+      ORDER BY
+        r.wait_time DESC
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Metric ingestion — active session health (1 min)
+  #   Feeds metric events: blocking_session_count, max_active_wait_ms,
+  #   max_elapsed_ms. Lightweight aggregation — no per-row detail needed.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - group: metric_active_sessions
+    interval:
+      minutes: 1
+    featureSet: DMV Wait Stats
+    ingest: metrics
+    timeout: var:longest-queries-timeout
+    dimensions:
+      - key: instance
+        value: col:instance_name
+      - key: server
+        value: col:server_name
+    metrics:
+      - key: sql.mssql.wait_stats.blocking_session_count
+        value: col:blocking_session_count
+      - key: sql.mssql.wait_stats.max_active_wait_ms
+        value: col:max_active_wait_ms
+      - key: sql.mssql.wait_stats.max_elapsed_ms
+        value: col:max_elapsed_ms
+    query: >-
+      SELECT
+        UPPER(ISNULL(CONVERT(sysname, SERVERPROPERTY('InstanceName')), 'MSSQLSERVER')) AS instance_name,
+        LEFT(CONVERT(sysname, SERVERPROPERTY('ServerName')),
+          ISNULL(NULLIF(CHARINDEX('\', CONVERT(sysname, SERVERPROPERTY('ServerName')))-1,-1),
+            LEN(CONVERT(sysname, SERVERPROPERTY('ServerName'))))) AS server_name,
+        COUNT(CASE WHEN r.blocking_session_id > 0 THEN 1 END) AS blocking_session_count,
+        ISNULL(MAX(r.wait_time), 0)                            AS max_active_wait_ms,
+        ISNULL(MAX(r.total_elapsed_time), 0)                   AS max_elapsed_ms
+      FROM sys.dm_exec_requests r WITH (NOLOCK)
+      WHERE r.session_id > 50
+        AND r.session_id <> @@SPID
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Metric ingestion — instance wait category totals (5 min)
+  #   Feeds metric events: lock_wait_total_ms, io_wait_total_ms,
+  #   cpu_wait_total_ms.
+  # ─────────────────────────────────────────────────────────────────────────────
+  - group: metric_instance_waits
+    interval:
+      minutes: 5
+    featureSet: DMV Wait Stats
+    ingest: metrics
+    timeout: var:longest-queries-timeout
+    dimensions:
+      - key: instance
+        value: col:instance_name
+      - key: server
+        value: col:server_name
+    metrics:
+      - key: sql.mssql.wait_stats.lock_wait_total_ms
+        value: col:lock_wait_total_ms
+      - key: sql.mssql.wait_stats.io_wait_total_ms
+        value: col:io_wait_total_ms
+      - key: sql.mssql.wait_stats.cpu_wait_total_ms
+        value: col:cpu_wait_total_ms
+    query: >-
+      SELECT
+        UPPER(ISNULL(CONVERT(sysname, SERVERPROPERTY('InstanceName')), 'MSSQLSERVER')) AS instance_name,
+        LEFT(CONVERT(sysname, SERVERPROPERTY('ServerName')),
+          ISNULL(NULLIF(CHARINDEX('\', CONVERT(sysname, SERVERPROPERTY('ServerName')))-1,-1),
+            LEN(CONVERT(sysname, SERVERPROPERTY('ServerName'))))) AS server_name,
+        ISNULL(SUM(CASE WHEN wait_type LIKE 'LCK%' THEN wait_time_ms END), 0)                     AS lock_wait_total_ms,
+        ISNULL(SUM(CASE WHEN wait_type IN ('PAGEIOLATCH_SH','PAGEIOLATCH_EX','PAGEIOLATCH_UP',
+          'ASYNC_IO_COMPLETION','IO_COMPLETION','WRITELOG') OR wait_type LIKE 'IO%'
+          THEN wait_time_ms END), 0)                                                               AS io_wait_total_ms,
+        ISNULL(SUM(CASE WHEN wait_type = 'SOS_SCHEDULER_YIELD' THEN wait_time_ms END), 0)         AS cpu_wait_total_ms
+      FROM sys.dm_os_wait_stats WITH (NOLOCK)
+      WHERE wait_time_ms > 0
