@@ -17,10 +17,15 @@ Dynatrace Extensions 2.0 extension for deep SQL Server wait stats observability.
 - Dynatrace tenant with **Extensions 2.0** support (v1.279+)
 - **ActiveGate** (v1.239+) reachable from your SQL Server, with the Database Observability module enabled
 - SQL Server login with at minimum `VIEW SERVER STATE` permission
-- Python 3.8+ on the machine used for signing and uploading
-- [dt-cli](https://github.com/dynatrace-oss/dt-cli):
+- Python 3.8+ on the machine used for signing
+- [dt-cli](https://github.com/dynatrace-oss/dt-cli) for certificate generation and bundle assembly/signing:
   ```bash
   pip install dt-cli
+  ```
+- [dtctl](https://github.com/dynatrace-oss/dtctl) for tenant management and upload:
+  ```bash
+  brew install dynatrace-oss/tap/dtctl   # macOS
+  # or download from the releases page
   ```
 - A Dynatrace API token with scopes: `extensions.read`, `extensions.write`
 
@@ -28,7 +33,25 @@ Dynatrace Extensions 2.0 extension for deep SQL Server wait stats observability.
 
 ## Deployment
 
-### 1. Generate a signing certificate (one-time per tenant)
+### 1. Configure dtctl context (one-time)
+
+Set up dtctl with your tenant URL and API token so you don't have to pass credentials on every command:
+
+```bash
+dtctl config add-context my-tenant \
+  --url https://<your-tenant>.dynatracelabs.com \
+  --token <your-api-token>
+
+dtctl config use-context my-tenant
+
+# Verify
+dtctl config current-context
+dtctl auth whoami
+```
+
+---
+
+### 2. Generate a signing certificate (one-time per tenant)
 
 If you don't already have a developer certificate for this tenant, generate one now. Keep these files safe — you'll reuse them for every future upload.
 
@@ -51,7 +74,7 @@ Paste the contents of `ca.pem` and save.
 
 ---
 
-### 2. Build the extension
+### 3. Build the extension
 
 From the root of this repository:
 
@@ -61,7 +84,7 @@ dt extension assemble --src src --output build/extension.zip
 
 ---
 
-### 3. Sign the bundle
+### 4. Sign the bundle
 
 ```bash
 dt extension sign \
@@ -72,17 +95,21 @@ dt extension sign \
 
 ---
 
-### 4. Upload to your tenant
+### 5. Upload to your tenant
 
 ```bash
-dt extension upload build/bundle.zip \
-  --tenant-url https://<your-tenant>.dynatracelabs.com \
-  --api-token <your-api-token>
+dtctl apply -f build/bundle.zip
+```
+
+Confirm the extension is available:
+
+```bash
+dtctl get extension custom:sql.mssql.wait-stats
 ```
 
 ---
 
-### 5. Activate and configure
+### 6. Activate and configure
 
 1. In the Dynatrace UI go to **Hub → Manage → Extension Execution Controller → custom:sql.mssql.wait-stats**
 2. Click **Activate** on the version you just uploaded
@@ -96,36 +123,42 @@ dt extension upload build/bundle.zip \
 
 ## Querying the data
 
-All log-based feature sets can be queried in Dynatrace via **Notebooks** or **Dashboards** using DQL:
+All log-based feature sets can be queried in Dynatrace via **Notebooks** or **Dashboards** using DQL. You can also run them directly with dtctl:
 
-```dql
-// Active session waits — last 5 minutes
-fetch logs, from:now()-5m
-| filter event.group == "dmv_active_wait_stats"
-| fields instance, server, session_id, wait_type, wait_category,
-         wait_time_ms, blocking_session_id, content
-| sort toLong(wait_time_ms) desc
-| limit 100
+```bash
+# Active session waits — last 5 minutes
+dtctl query "
+  fetch logs, from:now()-5m
+  | filter event.group == \"dmv_active_wait_stats\"
+  | fields instance, server, session_id, wait_type, wait_category,
+           wait_time_ms, blocking_session_id, content
+  | sort toLong(wait_time_ms) desc
+  | limit 100
+"
 ```
 
-```dql
-// Instance-level wait totals — last 30 minutes
-fetch logs, from:now()-30m
-| filter event.group == "dmv_instance_wait_stats"
-| fields instance, server, wait_type, wait_category,
-         waiting_tasks_count, total_wait_time_ms, avg_wait_time_ms
-| sort toLong(total_wait_time_ms) desc
-| limit 100
+```bash
+# Instance-level wait totals — last 30 minutes
+dtctl query "
+  fetch logs, from:now()-30m
+  | filter event.group == \"dmv_instance_wait_stats\"
+  | fields instance, server, wait_type, wait_category,
+           waiting_tasks_count, total_wait_time_ms, avg_wait_time_ms
+  | sort toLong(total_wait_time_ms) desc
+  | limit 100
+"
 ```
 
-```dql
-// Query Store wait stats — last 2 hours
-fetch logs, from:now()-2h
-| filter event.group == "query_wait_stats"
-| fields instance, server, query_id, wait_category,
-         total_wait_time_ms, avg_wait_time_ms, content
-| sort toLong(total_wait_time_ms) desc
-| limit 100
+```bash
+# Query Store wait stats — last 2 hours
+dtctl query "
+  fetch logs, from:now()-2h
+  | filter event.group == \"query_wait_stats\"
+  | fields instance, server, query_id, wait_category,
+           total_wait_time_ms, avg_wait_time_ms, content
+  | sort toLong(total_wait_time_ms) desc
+  | limit 100
+"
 ```
 
 Metric time series (for charting and alerting) are available under:
@@ -137,6 +170,29 @@ custom:sql.mssql.wait_stats.max_elapsed_ms
 custom:sql.mssql.wait_stats.lock_wait_total_ms
 custom:sql.mssql.wait_stats.io_wait_total_ms
 custom:sql.mssql.wait_stats.cpu_wait_total_ms
+```
+
+Query a metric time series with dtctl:
+
+```bash
+dtctl query "
+  timeseries max(custom:sql.mssql.wait_stats.blocking_session_count), from:now()-1h
+"
+```
+
+---
+
+## Managing the extension with dtctl
+
+```bash
+# List all versions uploaded to the tenant
+dtctl get extension custom:sql.mssql.wait-stats
+
+# Describe the active version
+dtctl describe extension custom:sql.mssql.wait-stats
+
+# Delete a specific version
+dtctl delete extension custom:sql.mssql.wait-stats:1.0.2
 ```
 
 ---
